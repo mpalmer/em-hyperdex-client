@@ -15,24 +15,45 @@ class EM::HyperDex::Client
 		end
 	end
 
-	def method_missing(m, *args)
-		unless @client.respond_to?("async_#{m}")
-			return super
-		end
+	HyperDex::Client::Client.
+	  instance_methods.
+	  map(&:to_s).
+	  grep(/^async_/).
+	  map { |m| m.gsub(/^async_/, '') }.
+	  each do |m|
+		class_eval <<-EOD, __FILE__, __LINE__
+			def #{m}(*args)
+				df = ::EM::DefaultDeferrable.new
 
-		df = ::EM::DefaultDeferrable.new
+				begin
+					if ::EM.reactor_running?
+						@outstanding[@client.__send__("async_#{m}", *args)] = df
+					else
+						df.succeed(@client.__send__(m, *args))
+					end
+				rescue HyperDex::Client::HyperDexClientException => ex
+					df.fail(ex)
+				end
 
-		begin
-			if ::EM.reactor_running?
-				@outstanding[@client.__send__("async_#{m}", *args)] = df
-			else
-				df.succeed(@client.__send__(m, *args))
+				df
 			end
-		rescue HyperDex::Client::HyperDexClientException => ex
-			df.fail(ex)
-		end
+		EOD
+	end
 
-		df
+	%w{search sorted_search}.each do |m|
+		class_eval <<-EOD, __FILE__, __LINE__
+			def #{m}(*args)
+				df = ::EM::DefaultDeferrable.new
+
+				begin
+					df.succeed(@client.__send__(m, *args))
+				rescue HyperDex::Client::HyperDexClientException => ex
+					df.fail(ex)
+				end
+
+				df
+			end
+		EOD
 	end
 
 	def handle_response
