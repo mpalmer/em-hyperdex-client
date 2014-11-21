@@ -7,6 +7,7 @@ module EM::HyperDex; end
 class EM::HyperDex::Client
 	def initialize(host, port)
 		@client = HyperDex::Client::Client.new(host, port)
+		@failed = false
 		@outstanding = {}
 
 		if ::EM.reactor_running?
@@ -27,6 +28,12 @@ class EM::HyperDex::Client
 		define_method(m) do |*args, &block|
 			df = ::EM::DefaultDeferrable.new
 
+			if @failed
+				return df.tap do |df|
+					df.fail(RuntimeError.new("This client has failed.  Please open a new one."))
+				end
+			end
+
 			begin
 				if ::EM.reactor_running?
 					@outstanding[@client.__send__(hyperdex_method, *args)] = df
@@ -45,6 +52,12 @@ class EM::HyperDex::Client
 
 	ITERATOR_METHODS.each do |m|
 		define_method(m) do |*args, &block|
+			if @failed
+				return ::EM::DefaultDeferrable.new.tap do |df|
+					df.fail(RuntimeError.new("This client has failed.  Please open a new one."))
+				end
+			end
+
 			iter = @client.__send__(m, *args)
 			df = DeferrableEnumerable.new(iter)
 			df.callback(&block) if block_given?
@@ -59,19 +72,25 @@ class EM::HyperDex::Client
 
 	def handle_response
 		begin
-			df = @client.method(:loop).arity == 0 ?
-			     @outstanding.delete(op = @client.loop) :
-			     @outstanding.delete(op = @client.loop(0))
+			df = @outstanding.delete(op = @client.loop(0))
+		rescue HyperDex::Client::HyperDexClientException
+			# Something has gone wrong, and we're just going to take our bat
+			# and ball and go home.
+			@outstanding.values.each { |op| op.fail(ex) }
+			@failed = true
+			return
+		end
 
-			# It's possible for the client's poll_fd to see activity when there
-			# isn't any new completed operation; according to rescrv, this can
-			# happen "because of background activity".  In that case, `#loop`
-			# called with a timeout will return `nil`, and we should just
-			# return quietly.
-			if op.nil?
-				return
-			end
+		# It's possible for the client's poll_fd to see activity when there
+		# isn't any new completed operation; according to rescrv, this can
+		# happen "because of background activity".  In that case, `#loop`
+		# called with a timeout will return `nil`, and we should just
+		# return quietly.
+		if op.nil?
+			return
+		end
 
+		begin
 			if df.respond_to?(:item_available)
 				df.item_available
 			else
@@ -113,19 +132,15 @@ class EM::HyperDex::Client
 		end
 
 		def item_available
-			begin
-				val = @iter.next
-				if val.nil?
-					succeed
-				else
-					begin
-						@each_block.call(val)
-					rescue Exception => ex
-						fail(ex)
-					end
+			val = @iter.next
+			if val.nil?
+				succeed
+			else
+				begin
+					@each_block.call(val)
+				rescue Exception => ex
+					fail(ex)
 				end
-			rescue HyperDex::Client::HyperDexClientException => ex
-				fail(ex)
 			end
 		end
 	end
