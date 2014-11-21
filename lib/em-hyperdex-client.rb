@@ -21,36 +21,62 @@ class EM::HyperDex::Client
 	                  grep(/^async_/).
 	                  map { |m| m.gsub(/^async_/, '') }
 
+	ASYNC_METHODS.each do |m|
+		hyperdex_method = "async_#{m}"
+
+		define_method(m) do |*args, &block|
+			df = ::EM::DefaultDeferrable.new
+
+			begin
+				if ::EM.reactor_running?
+					@outstanding[@client.__send__(hyperdex_method, *args)] = df
+				else
+					df.succeed(@client.__send__(m, *args))
+				end
+			rescue HyperDex::Client::HyperDexClientException => ex
+				df.fail(ex)
+			end
+
+			df
+		end
+	end
+
 	ITERATOR_METHODS = %w{search sorted_search}
 
-	(ASYNC_METHODS + ITERATOR_METHODS).each do |m|
-		hyperdex_method = ITERATOR_METHODS.include?(m) ?
-		                    m :
-		                    "async_#{m}"
+	ITERATOR_METHODS.each do |m|
+		define_method(m) do |*args, &block|
+			iter = @client.__send__(m, *args)
+			df = DeferrableEnumerable.new(iter)
+			df.callback(&block) if block_given?
 
-		class_eval <<-EOD, __FILE__, __LINE__
-			def #{m}(*args)
-				df = ::EM::DefaultDeferrable.new
-
-				begin
-					if ::EM.reactor_running?
-						@outstanding[@client.__send__(#{hyperdex_method}, *args)] = df
-					else
-						df.succeed(@client.__send__(m, *args))
-					end
-				rescue HyperDex::Client::HyperDexClientException => ex
-					df.fail(ex)
-				end
-
-				df
+			begin
+				@outstanding[iter] = df
+			rescue HyperDex::Client::HyperDexClientException => ex
+				::EM::DefaultDeferrable.new.fail(ex)
 			end
-		EOD
+		end
 	end
 
 	def handle_response
 		begin
-			df = @outstanding.delete(op = @client.loop)
-			df.succeed(resp.wait)
+			df = @client.method(:loop).arity == 0 ?
+			     @outstanding.delete(op = @client.loop) :
+			     @outstanding.delete(op = @client.loop(0))
+
+			# It's possible for the client's poll_fd to see activity when there
+			# isn't any new completed operation; according to rescrv, this can
+			# happen "because of background activity".  In that case, `#loop`
+			# called with a timeout will return `nil`, and we should just
+			# return quietly.
+			if op.nil?
+				return
+			end
+
+			if df.respond_to?(:item_available)
+				df.item_available
+			else
+				df.succeed(op.wait)
+			end
 		rescue HyperDex::Client::HyperDexClientException => ex
 			df.fail(ex)
 		end
@@ -69,6 +95,38 @@ class EM::HyperDex::Client
 
 		def notify_readable
 			@em_client.handle_response
+		end
+	end
+
+	class DeferrableEnumerable
+		include Enumerable
+		include ::EM::Deferrable
+
+		def initialize(iter)
+			@iter = iter
+		end
+
+		def each(&blk)
+			return self unless block_given?
+
+			@each_block = blk
+		end
+
+		def item_available
+			begin
+				val = @iter.next
+				if val.nil?
+					succeed
+				else
+					begin
+						@each_block.call(val)
+					rescue Exception => ex
+						fail(ex)
+					end
+				end
+			rescue HyperDex::Client::HyperDexClientException => ex
+				fail(ex)
+			end
 		end
 	end
 end
