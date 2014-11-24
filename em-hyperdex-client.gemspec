@@ -17,7 +17,7 @@ Gem::Specification.new do |s|
 
 	s.add_runtime_dependency "eventmachine", "~> 1.0"
 	s.add_runtime_dependency "git-version-bump", "~> 0.10"
-	s.add_runtime_dependency "hyperdex", '>= 1.4.4.3'
+	s.add_runtime_dependency "hyperdex", '>= 1.4.5.pre', '< 2'
 
 	s.add_development_dependency 'bundler'
 	s.add_development_dependency 'eventmachine'
